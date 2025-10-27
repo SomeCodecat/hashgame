@@ -1,0 +1,16 @@
+[package]
+name = "rust_miner"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rayon = "1.10.0"
+# Use rustls TLS backend to avoid OpenSSL native dependencies when cross-compiling
+reqwest = { version = "0.12.24", features = ["blocking", "rustls-tls"] }
+sha2 = "0.10.8"
+hex = "0.4.3"
+num_cpus = "1.16.0"
+chrono = "0.4"
+itoa = "1.0.15"
+ocl = "0.19"
+
