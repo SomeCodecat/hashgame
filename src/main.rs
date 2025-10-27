@@ -73,7 +73,7 @@ struct MinerConfig {
 
 fn parse_reporting_config_and_name() -> (String, Duration, Duration, Duration, bool, Option<usize>, Option<usize>, MinerConfig) {
     // Defaults
-    let mut short_secs = 2u64;
+    let mut short_secs = 1u64;
     let mut detailed_secs = 60u64;
     let mut avg_window_secs = 300u64;
     let mut name_prefix: Option<String> = None;

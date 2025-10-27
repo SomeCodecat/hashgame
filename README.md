@@ -29,7 +29,7 @@ GPU_BATCH_SIZE=4194304 ./target/release/rust_miner --name AS --gpu --gpu-workers
 ./target/release/rust_miner --name AS --gpu --work-group-size 256
 ```
 
-**Expected performance:** ~1500 MH/s on RTX 4070 SUPER
+**Expected performance:** ~1000-1100 MH/s on RTX 4070 SUPER
 
 ### Maximum CPU Performance
 
