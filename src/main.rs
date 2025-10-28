@@ -596,7 +596,7 @@ fn find_seed(
                 // report elapsed time since round start in brackets
                 let elapsed_since_round = fmt_duration_hms(now.duration_since(round_start));
                 print!(
-                    "{} [{}] total: {}  avg: {:.3} MH/s  inst: {:.3} MH/s  best: {} bits  req: {}\r",
+                    "{} [{}] total: {}  avg: {:.3} MH/s  inst: {:.3} MH/s  best: {} bits  req: {}    \r",
                     ts(), elapsed_since_round, total, avg_mh, inst_mh, best, required
                 );
                 io::stdout().flush().ok();
@@ -762,19 +762,12 @@ fn find_seed(
 
 fn count_zerobits(hash: &[u8]) -> usize {
     let mut bits = 0;
-    // Process in u64 chunks for better performance (8 bytes at a time)
-    let ptr = hash.as_ptr() as *const u64;
-    
-    // Safety: SHA256 hash is always 32 bytes, so we can safely read 4 u64s
-    unsafe {
-        for i in 0..4 {
-            let val = ptr.add(i).read();
-            if val == 0 {
-                bits += 64;
-            } else {
-                bits += val.leading_zeros() as usize;
-                return bits;
-            }
+    for &byte in hash.iter() {
+        if byte == 0 {
+            bits += 8;
+        } else {
+            bits += byte.leading_zeros() as usize;
+            return bits;
         }
     }
     bits
@@ -824,193 +817,246 @@ fn find_seed_gpu(
 
     // Optimized OpenCL SHA-256 kernel with GPU-side message construction and result filtering
     let src = r#"
-    // Optimized SHA-256 implementation in OpenCL C
-    #define rotr(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
-    #define ch(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
-    #define maj(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
-    #define big_sigma0(x) (rotr(x,2) ^ rotr(x,13) ^ rotr(x,22))
-    #define big_sigma1(x) (rotr(x,6) ^ rotr(x,11) ^ rotr(x,25))
-    #define small_sigma0(x) (rotr(x,7) ^ rotr(x,18) ^ ((x) >> 3))
-    #define small_sigma1(x) (rotr(x,17) ^ rotr(x,19) ^ ((x) >> 10))
+/*
+ * OpenCL SHA-256 Kernel
+ *
+ * This code runs on the GPU. It includes a full SHA-256 implementation
+ * and a helper to convert a ulong (u64) nonce into a hex string,
+ * which is required by the game's hash format.
+ */
 
-    __constant uint K[64] = {
-        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
-    };
+// --- SHA-256 Implementation (for OpenCL) ---
+// (This is a standard, compact SHA-256 implementation adapted for OpenCL)
 
-    // Count leading zero bits in hash (8 uints = 32 bytes)
-    inline uint count_leading_zerobits(__private uint* hash) {
-        uint count = 0;
-        for (int i = 0; i < 8; i++) {
-            uint val = hash[i];
-            if (val == 0) {
-                count += 32;
-            } else {
-                count += clz(val);
-                break;
-            }
-        }
-        return count;
+#define ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+#define SHR(x, n) ((x) >> (n))
+#define CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
+#define MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+#define EP0(x) (ROTR(x, 2) ^ ROTR(x, 13) ^ ROTR(x, 22))
+#define EP1(x) (ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(x, 25))
+#define SIG0(x) (ROTR(x, 7) ^ ROTR(x, 18) ^ SHR(x, 3))
+#define SIG1(x) (ROTR(x, 17) ^ ROTR(x, 19) ^ SHR(x, 10))
+
+typedef struct {
+    uchar M[64];
+    uint H[8];
+    ulong N;
+} sha256_ctx;
+
+constant uint K[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+// --- End of SHA-256 ---
+
+
+// Helper to convert a ulong nonce to a 1-16 char hex string
+inline int ulong_to_hex(ulong n, char* out) {
+    const char hex_chars[] = "0123456789abcdef";
+    char buf[16];
+    int i = 0;
+
+    if (n == 0) {
+        out[0] = '0';
+        return 1;
     }
 
-    // Optimized kernel: construct messages on GPU, only return qualifying results
-    __kernel void sha256_mine_kernel(
-        __global const uchar* parent_bytes,
-        uint parent_len,
-        __global const uchar* name_bytes,
-        uint name_len,
-        ulong seed_base,
-        uint required_bits,
-        __global uint* result_counts,
-        __global ulong* result_seeds,
-        __global uint* result_bits,
-        __global uint* best_bits_global
-    ) {
-        size_t gid = get_global_id(0);
-        ulong seed = seed_base + gid;
+    while (n > 0) {
+        buf[i++] = hex_chars[n & 0xF];
+        n >>= 4;
+    }
+
+    for (int j = 0; j < i; j++) {
+        out[j] = buf[i - 1 - j];
+    }
+    return i;
+}
+
+
+// SHA-256 transform function
+void sha256_transform(sha256_ctx *ctx) {
+    uint W[64];
+    uint a, b, c, d, e, f, g, h;
+    
+    #pragma unroll
+    for (int i = 0, j = 0; i < 16; i++, j += 4) {
+        W[i] = (ctx->M[j] << 24) | (ctx->M[j + 1] << 16) | (ctx->M[j + 2] << 8) | ctx->M[j + 3];
+    }
+
+    #pragma unroll
+    for (int i = 16; i < 64; i++) {
+        W[i] = SIG1(W[i - 2]) + W[i - 7] + SIG0(W[i - 15]) + W[i - 16];
+    }
+
+    a = ctx->H[0]; b = ctx->H[1]; c = ctx->H[2]; d = ctx->H[3];
+    e = ctx->H[4]; f = ctx->H[5]; g = ctx->H[6]; h = ctx->H[7];
+
+    #pragma unroll
+    for (int i = 0; i < 64; i++) {
+        uint T1 = h + EP1(e) + CH(e, f, g) + K[i] + W[i];
+        uint T2 = EP0(a) + MAJ(a, b, c);
+        h = g; g = f; f = e; e = d + T1;
+        d = c; c = b; b = a; a = T1 + T2;
+    }
+
+    ctx->H[0] += a; ctx->H[1] += b; ctx->H[2] += c; ctx->H[3] += d;
+    ctx->H[4] += e; ctx->H[5] += f; ctx->H[6] += g; ctx->H[7] += h;
+}
+
+// Main SHA-256 function
+void sha256(const uchar* data, int len, uchar* hash_out) {
+    sha256_ctx ctx;
+    
+    ctx.H[0] = 0x6a09e667; ctx.H[1] = 0xbb67ae85; ctx.H[2] = 0x3c6ef372; ctx.H[3] = 0xa54ff53a;
+    ctx.H[4] = 0x510e527f; ctx.H[5] = 0x9b05688c; ctx.H[6] = 0x1f83d9ab; ctx.H[7] = 0x5be0cd19;
+    ctx.N = 0;
+
+    int pos = 0;
+    while(pos < len) {
+        int copy_len = min(64 - (int)(ctx.N % 64), len - pos);
         
-        // Build message on GPU: parent + name + seed_str
-        uchar msg_buf[128];
-        uint pos = 0;
-        
-        // Copy parent
-        for (uint i = 0; i < parent_len && pos < 120; i++) {
-            msg_buf[pos++] = parent_bytes[i];
+        for(int i=0; i < copy_len; i++) {
+            ctx.M[(ctx.N % 64) + i] = data[pos + i];
         }
-        
-        // Copy name
-        for (uint i = 0; i < name_len && pos < 120; i++) {
-            msg_buf[pos++] = name_bytes[i];
+
+        ctx.N += copy_len;
+        pos += copy_len;
+
+        if ((ctx.N % 64) == 0) {
+            sha256_transform(&ctx);
         }
-        
-        // Convert seed to string (simple itoa on GPU)
-        uchar seed_str[24];
-        ulong temp = seed;
-        int seed_len = 0;
-        if (temp == 0) {
-            seed_str[seed_len++] = '0';
+    }
+
+    // Padding
+    int n_mod_64 = (int)(ctx.N % 64);
+    ctx.M[n_mod_64++] = 0x80;
+    
+    if (n_mod_64 > 56) {
+        for(int i=n_mod_64; i < 64; i++) {
+            ctx.M[i] = 0;
+        }
+        sha256_transform(&ctx);
+        n_mod_64 = 0;
+    }
+    
+    for(int i=n_mod_64; i < 56; i++) {
+        ctx.M[i] = 0;
+    }
+    
+    ulong n_bits = ctx.N * 8;
+    ctx.M[56] = (uchar)(n_bits >> 56);
+    ctx.M[57] = (uchar)(n_bits >> 48);
+    ctx.M[58] = (uchar)(n_bits >> 40);
+    ctx.M[59] = (uchar)(n_bits >> 32);
+    ctx.M[60] = (uchar)(n_bits >> 24);
+    ctx.M[61] = (uchar)(n_bits >> 16);
+    ctx.M[62] = (uchar)(n_bits >> 8);
+    ctx.M[63] = (uchar)(n_bits);
+
+    sha256_transform(&ctx);
+    
+    for(int i = 0; i < 8; i++) {
+        hash_out[i*4 + 0] = (uchar)(ctx.H[i] >> 24);
+        hash_out[i*4 + 1] = (uchar)(ctx.H[i] >> 16);
+        hash_out[i*4 + 2] = (uchar)(ctx.H[i] >> 8);
+        hash_out[i*4 + 3] = (uchar)(ctx.H[i]);
+    }
+}
+
+
+// Helper to check for N leading zero bits
+inline int count_zero_bits_kernel(const uchar* hash, int difficulty) {
+    int bits = 0;
+    for (int i = 0; i < 32; i++) {
+        uchar byte = hash[i];
+        if (byte == 0) {
+            bits += 8;
         } else {
-            uchar digits[24];
-            int digit_count = 0;
-            while (temp > 0 && digit_count < 24) {
-                digits[digit_count++] = (temp % 10) + '0';
-                temp /= 10;
+            uchar b = byte;
+            while ((b & 0x80) == 0) {
+                bits++;
+                b <<= 1;
             }
-            for (int i = digit_count - 1; i >= 0; i--) {
-                seed_str[seed_len++] = digits[i];
-            }
+            break;
         }
-        
-        // Append seed string
-        for (int i = 0; i < seed_len && pos < 120; i++) {
-            msg_buf[pos++] = seed_str[i];
-        }
-        
-        uint msg_len = pos;
-        
-        // SHA-256 with optimized padding (single block for messages < 56 bytes)
-        uint w[64];
-        
-        // Load message into first 16 words (big-endian)
-        #pragma unroll
-        for (uint i = 0; i < 14; i++) {
-            w[i] = ((uint)msg_buf[i*4] << 24) | ((uint)msg_buf[i*4+1] << 16) | 
-                   ((uint)msg_buf[i*4+2] << 8) | ((uint)msg_buf[i*4+3]);
-        }
-        
-        // Handle partial last word and padding
-        uint last_idx = msg_len / 4;
-        uint remainder = msg_len % 4;
-        uint last_word = 0;
-        
-        if (remainder > 0) {
-            for (uint i = 0; i < remainder; i++) {
-                last_word |= ((uint)msg_buf[last_idx*4 + i]) << (24 - i*8);
-            }
-            last_word |= 0x80 << (24 - remainder*8);
-        } else {
-            last_word = 0x80000000;
-        }
-        
-        if (last_idx < 14) {
-            w[last_idx] = last_word;
-            for (uint i = last_idx + 1; i < 14; i++) {
-                w[i] = 0;
-            }
-        } else {
-            w[14] = last_word;
-        }
-        
-        w[14] = 0;
-        w[15] = msg_len * 8;  // Length in bits (big-endian, low word)
-        
-        // Extend to 64 words
-        #pragma unroll 4
-        for (uint i = 16; i < 64; i++) {
-            w[i] = small_sigma1(w[i-2]) + w[i-7] + small_sigma0(w[i-15]) + w[i-16];
-        }
-        
-        // Initialize hash values
-        uint h0 = 0x6a09e667;
-        uint h1 = 0xbb67ae85;
-        uint h2 = 0x3c6ef372;
-        uint h3 = 0xa54ff53a;
-        uint h4 = 0x510e527f;
-        uint h5 = 0x9b05688c;
-        uint h6 = 0x1f83d9ab;
-        uint h7 = 0x5be0cd19;
-        
-        uint a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
-        
-        // Main compression loop (unrolled for performance)
-        #pragma unroll 8
-        for (uint i = 0; i < 64; i++) {
-            uint T1 = h + big_sigma1(e) + ch(e,f,g) + K[i] + w[i];
-            uint T2 = big_sigma0(a) + maj(a,b,c);
-            h = g; g = f; f = e; e = d + T1;
-            d = c; c = b; b = a; a = T1 + T2;
-        }
-        
-        // Final hash values
-        uint hash[8];
-        hash[0] = h0 + a;
-        hash[1] = h1 + b;
-        hash[2] = h2 + c;
-        hash[3] = h3 + d;
-        hash[4] = h4 + e;
-        hash[5] = h5 + f;
-        hash[6] = h6 + g;
-        hash[7] = h7 + h;
-        
-        // Count leading zero bits
-        uint bits = count_leading_zerobits(hash);
-        
-        // Update global best atomically
-        atomic_max(best_bits_global, bits);
-        
-        // Only return results that meet or exceed required bits
-        if (bits >= required_bits && required_bits > 0) {
-            uint idx = atomic_inc(result_counts);
-            if (idx < 256) {  // Limit results buffer size
-                result_seeds[idx] = seed;
-                result_bits[idx] = bits;
+        if (bits >= difficulty) break;
+    }
+    return bits;
+}
+
+
+/*
+ * == The Main Kernel ==
+ */
+__kernel void find_hash_kernel(
+    __global const uchar* base_line,
+    int base_len,
+    ulong start_nonce,
+    uint difficulty,
+    __global uint* result_local_id,
+    __global uchar* result_hash,
+    __global uint* best_bits_global
+) {
+    ulong global_id = get_global_id(0);
+    ulong nonce = start_nonce + global_id;
+
+    // --- Optimization: Check if already found before doing any work ---
+    if (*result_local_id != (uint)(-1)) {
+        return;
+    }
+
+    // 1. Construct the input string: "parent_hash name nonce_hex"
+    uchar line[256];
+    
+    for(int i=0; i < base_len; i++) {
+        line[i] = base_line[i];
+    }
+
+    char nonce_hex[17];
+    int nonce_len = ulong_to_hex(nonce, nonce_hex);
+
+    for(int i=0; i < nonce_len; i++) {
+        line[base_len + i] = nonce_hex[i];
+    }
+    
+    int total_len = base_len + nonce_len;
+
+    // 2. Hash the constructed line
+    uchar hash_output[32];
+    sha256(line, total_len, hash_output);
+
+    // 3. Check if the hash meets the difficulty
+    int bits = count_zero_bits_kernel(hash_output, difficulty);
+
+    // Update global best atomically
+    atomic_max(best_bits_global, (uint)bits);
+
+    if (bits >= difficulty) {
+        // We found a winner!
+        // Atomically write our global_id (if no one else has)
+        if (atomic_cmpxchg(result_local_id, (uint)(-1), (uint)global_id) == (uint)(-1)) {
+            // We were first! Write our hash to the output buffer.
+            for(int i=0; i < 32; i++) {
+                result_hash[i] = hash_output[i];
             }
         }
     }
-    "#;
+}
+"#;
 
     // Compile program
     let program = match Program::builder().src(src).build(&context) {
         Ok(p) => p,
         Err(e) => { eprintln!("Failed to build OpenCL program: {}. Falling back to CPU.", e); return find_seed(state, parent, num_cpus::get(), short_interval, detailed_interval, average_window, name); }
     };
-    // OpenCL program compiled
+    println!("OpenCL kernel compiled successfully");
 
     // Batch settings (tunable via env): number of seeds per kernel dispatch and number of parallel GPU worker threads
     let env_batch = env::var("GPU_BATCH_SIZE").ok().and_then(|s| s.parse::<usize>().ok());
@@ -1023,6 +1069,9 @@ fn find_seed_gpu(
     let total_hashes = Arc::new(AtomicUsize::new(0));
     let best_overall = Arc::new(AtomicUsize::new(0));
     let best_per_thread = Arc::new(Mutex::new(vec![0usize; gpu_workers]));
+
+    // Capture round start time for elapsed time reporting
+    let round_start = Instant::now();
 
     // Simple monitor thread to detect parent updates
     let monitor_state = state.clone();
@@ -1081,9 +1130,10 @@ fn find_seed_gpu(
             let required = reporter_state.difficulty.load(Ordering::SeqCst);
             let avg_mh = avg_rate / 1e6_f64;
             let inst_mh = inst_rate / 1e6_f64;
+            let elapsed_since_round = fmt_duration_hms(now.duration_since(round_start));
             print!(
-                "[{}] total: {}  avg: {:.3} MH/s  inst: {:.3} MH/s  best: {} bits  req: {}\r",
-                Local::now().format("%H:%M:%S"), total, avg_mh, inst_mh, best, required
+                "{} [{}] total: {}  avg: {:.3} MH/s  inst: {:.3} MH/s  best: {} bits  req: {}    \r",
+                ts(), elapsed_since_round, total, avg_mh, inst_mh, best, required
             );
             io::stdout().flush().ok();
 
@@ -1114,14 +1164,14 @@ fn find_seed_gpu(
 
     // Per-worker launch: each worker has its own buffers and kernel to avoid host-side synchronization
     let mut handles = Vec::with_capacity(gpu_workers);
-    let parent_bytes = parent.as_bytes().to_vec();
-    let name_bytes = format!(" {} ", name).into_bytes();
+    // Construct base_line: "parent_hash name " (with trailing space before nonce)
+    let base_line = format!("{} {} ", parent, name);
+    let base_line_bytes = base_line.as_bytes().to_vec();
     let program = program.clone();
 
     for worker_id in 0..gpu_workers {
         let queue = queue.clone();
-        let parent_bytes = parent_bytes.clone();
-        let name_bytes = name_bytes.clone();
+        let base_line_bytes = base_line_bytes.clone();
         let state = state.clone();
         let total_hashes = total_hashes.clone();
         let best_overall = best_overall.clone();
@@ -1129,40 +1179,30 @@ fn find_seed_gpu(
         let program = program.clone();
 
         let handle = thread::spawn(move || {
-            // Prepare persistent buffers per worker (read-only parent/name buffers, reused result buffers)
-            let parent_buf: Buffer<u8> = Buffer::builder()
+            // Prepare persistent buffers per worker
+            let base_line_buf: Buffer<u8> = Buffer::builder()
                 .queue(queue.clone())
                 .flags(flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR)
-                .len(parent_bytes.len())
-                .copy_host_slice(&parent_bytes)
+                .len(base_line_bytes.len())
+                .copy_host_slice(&base_line_bytes)
                 .build().unwrap();
 
-            let name_buf: Buffer<u8> = Buffer::builder()
-                .queue(queue.clone())
-                .flags(flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR)
-                .len(name_bytes.len())
-                .copy_host_slice(&name_bytes)
-                .build().unwrap();
-
-            // Result buffers (small, only for qualifying results)
-            let result_count_buf: Buffer<u32> = Buffer::builder()
+            // Result buffers for the new kernel
+            // result_local_id: single u32, initialized to -1 (0xFFFFFFFF)
+            let result_local_id_buf: Buffer<u32> = Buffer::builder()
                 .queue(queue.clone())
                 .flags(flags::MEM_READ_WRITE)
                 .len(1)
                 .build().unwrap();
 
-            let result_seeds_buf: Buffer<u64> = Buffer::builder()
+            // result_hash: 32 bytes
+            let result_hash_buf: Buffer<u8> = Buffer::builder()
                 .queue(queue.clone())
                 .flags(flags::MEM_WRITE_ONLY)
-                .len(256)
+                .len(32)
                 .build().unwrap();
 
-            let result_bits_buf: Buffer<u32> = Buffer::builder()
-                .queue(queue.clone())
-                .flags(flags::MEM_WRITE_ONLY)
-                .len(256)
-                .build().unwrap();
-
+            // best_bits_global: single u32 to track best across all work items
             let best_bits_buf: Buffer<u32> = Buffer::builder()
                 .queue(queue.clone())
                 .flags(flags::MEM_READ_WRITE)
@@ -1171,49 +1211,46 @@ fn find_seed_gpu(
 
             let kernel = Kernel::builder()
                 .program(&program)
-                .name("sha256_mine_kernel")
+                .name("find_hash_kernel")
                 .queue(queue.clone())
                 .global_work_size(batch_size)
-                .arg(&parent_buf)
-                .arg(parent_bytes.len() as u32)
-                .arg(&name_buf)
-                .arg(name_bytes.len() as u32)
-                .arg(0u64)  // seed_base placeholder
-                .arg(0u32)  // required_bits placeholder
-                .arg(&result_count_buf)
-                .arg(&result_seeds_buf)
-                .arg(&result_bits_buf)
+                .arg(&base_line_buf)
+                .arg(base_line_bytes.len() as i32)
+                .arg(0u64)  // start_nonce placeholder
+                .arg(0u32)  // difficulty placeholder
+                .arg(&result_local_id_buf)
+                .arg(&result_hash_buf)
                 .arg(&best_bits_buf)
                 .build().unwrap();
 
-            let mut result_count_host = vec![0u32; 1];
-            let mut result_seeds_host = vec![0u64; 256];
-            let mut result_bits_host = vec![0u32; 256];
+            let mut result_local_id_host = vec![0xFFFFFFFFu32; 1];
+            let mut result_hash_host = vec![0u8; 32];
             let mut best_bits_host = vec![0u32; 1];
 
-            // Seed base per worker to avoid overlap
-            let mut seed_base: u64 = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64 + (worker_id as u64 * 1000000);
+            // Nonce base per worker to avoid overlap
+            let mut nonce_base: u64 = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64 + (worker_id as u64 * 1000000);
 
             while !state.solution_found.load(Ordering::SeqCst) {
                 let required = state.difficulty.load(Ordering::SeqCst);
                 
-                // Reset result counters
-                result_count_host[0] = 0;
+                // Reset result_local_id to -1 (no solution found yet)
+                result_local_id_host[0] = 0xFFFFFFFF;
+                result_local_id_buf.write(&result_local_id_host).enq().unwrap();
+
+                // Reset best_bits to 0 for this batch
                 best_bits_host[0] = 0;
-                result_count_buf.write(&result_count_host).enq().unwrap();
                 best_bits_buf.write(&best_bits_host).enq().unwrap();
 
                 // Set kernel arguments for this batch
-                kernel.set_arg(4, seed_base).unwrap();
-                kernel.set_arg(5, required as u32).unwrap();
+                kernel.set_arg(2, nonce_base).unwrap();
+                kernel.set_arg(3, required as u32).unwrap();
 
-                // Launch kernel (async if possible)
+                // Launch kernel
                 unsafe { kernel.enq().unwrap(); }
 
-                // Read back only small result buffers (async read, then wait)
-                result_count_buf.read(&mut result_count_host).enq().unwrap();
+                // Read back result_local_id and best_bits
+                result_local_id_buf.read(&mut result_local_id_host).enq().unwrap();
                 best_bits_buf.read(&mut best_bits_host).enq().unwrap();
-                
                 queue.finish().unwrap();  // Wait for kernel + reads to complete
 
                 // Update stats
@@ -1227,31 +1264,30 @@ fn find_seed_gpu(
                         per[worker_id] = gpu_best;
                     }
                 }
-
-                // Check if we have qualifying results
-                let count = result_count_host[0].min(256);
-                if count > 0 {
-                    // Read result arrays only if we have hits
-                    result_seeds_buf.read(&mut result_seeds_host[..count as usize]).enq().unwrap();
-                    result_bits_buf.read(&mut result_bits_host[..count as usize]).enq().unwrap();
+                
+                // Check if a solution was found
+                if result_local_id_host[0] != 0xFFFFFFFF {
+                    // Solution found! Read the hash
+                    result_hash_buf.read(&mut result_hash_host).enq().unwrap();
                     queue.finish().unwrap();
-
-                    for i in 0..count as usize {
-                        let seed = result_seeds_host[i];
-                        let bits = result_bits_host[i] as usize;
-                        
-                        if bits >= required && required > 0 {
-                            let seed_string = seed.to_string();
-                            if state.solution_found.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
-                                println!("GPU worker {} found seed {} with {} bits", worker_id, seed_string, bits);
-                                return Some(seed_string);
-                            }
-                        }
+                    
+                    // Calculate the winning nonce
+                    let winning_nonce = nonce_base + (result_local_id_host[0] as u64);
+                    
+                    // Count the bits in the hash for reporting
+                    let bits = count_zerobits(&result_hash_host);
+                    
+                    if state.solution_found.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                        // Format nonce as hex string (matching the game's format)
+                        let nonce_string = format!("{:x}", winning_nonce);
+                        println!("GPU worker {} found nonce {} with {} bits", worker_id, nonce_string, bits);
+                        return Some(nonce_string);
                     }
+                    break;
                 }
 
-                // Advance base to avoid overlap with other workers (much larger stride now)
-                seed_base = seed_base.wrapping_add((gpu_workers * batch_size) as u64);
+                // Advance nonce base to avoid overlap with other workers
+                nonce_base = nonce_base.wrapping_add((gpu_workers * batch_size) as u64);
                 
                 if state.solution_found.load(Ordering::SeqCst) { break; }
             }
